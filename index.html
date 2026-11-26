@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Glasmacher — A Glassblowing Game</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #0d0a08;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden; touch-action: none;
+    font-family: Georgia, 'Times New Roman', serif;
+  }
+  canvas {
+    max-width: 100vw; max-height: 100vh;
+    aspect-ratio: 3 / 2;
+    width: 100%;
+    cursor: pointer;
+    border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="640"></canvas>
+<script>
+'use strict';
+
+/* ============================== setup ============================== */
+
+const cvs = document.getElementById('game');
+const ctx = cvs.getContext('2d');
+const W = cvs.width, H = cvs.height;
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp  = (a, b, t) => a + (b - a) * t;
+const rand  = (a, b) => a + Math.random() * (b - a);
+const pick  = arr => arr[Math.floor(Math.random() * arr.length)];
+const fmt   = n => '$' + Math.round(n);
+
+/* ============================== audio ============================== */
+
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  return AC;
+}
+function beep(freq = 440, dur = 0.08, type = 'sine', vol = 0.12) {
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = freq;
+  o.connect(g); g.connect(ac.destination);
+  const now = ac.currentTime;
+  g.gain.setValueAtTime(vol, now);
+  g.gain.exponentialRampToValueAtTime(0.001, now + dur);
+  o.start(now); o.stop(now + dur);
+}
+function noiseBurst(dur = 0.3, vol = 0.25) {
+  const ac = audio(); if (!ac) return;
+  const len = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const src = ac.createBufferSource(), g = ac.createGain();
+  src.buffer = buf;
+  src.connect(g); g.connect(ac.destination);
+  g.gain.value = vol;
+  src.start();
+}
+
+/* ============================== content ============================== */
+
+const COLORS = {
+  clear:  { name: 'Clear',     price: 0,   base: 22,  glass: '#cfeaf4', lite: '#ffffff', dark: '#8fb8c4' },
+  sea:    { name: 'Sea Green', price: 0,   base: 30,  glass: '#7fd4b0', lite: '#d6ffe9', dark: '#4a8f6f' },
+  cobalt: { name: 'Cobalt',    price: 70,  base: 46,  glass: '#4f7ff0', lite: '#a9c4ff', dark: '#2c4a99' },
+  amber:  { name: 'Amber',     price: 160, base: 62,  glass: '#f0a63c', lite: '#ffd894', dark: '#9c6415' },
+  ruby:   { name: 'Ruby',      price: 380, base: 84,  glass: '#e84a5f', lite: '#ff9fae', dark: '#93202f' },
+  gold:   { name: 'Gold Leaf', price: 850, base: 120, glass: '#ffd75e', lite: '#fff3bf', dark: '#b8912a' },
+};
+
+const SIZES = {
+  small:  { name: 'Small',  target: 40, mult: 1.0  },
+  medium: { name: 'Medium', target: 56, mult: 1.25 },
+  large:  { name: 'Large',  target: 74, mult: 1.55 },
+};
+
+const SHAPES = {
+  ornament: { name: 'Ornament', taps: 1, mult: 0.85 },
+  bottle:   { name: 'Bottle',   taps: 2, mult: 1.15 },
+  bowl:     { name: 'Bowl',     taps: 2, mult: 1.3  },
+  vase:     { name: 'Vase',     taps: 3, mult: 1.6  },
+};
+
+const UPGRADES = [
+  { key: 'tongs', name: 'Jacks',       desc: 'Wider shaping zones.', costs: [130, 340] },
+  { key: 'hose',  name: 'Blowhose',    desc: 'Glass cools slower.',  costs: [110, 280] },
+  { key: 'gauge', name: 'Calipers',    desc: 'Shows the exact target size while blowing.', costs: [160] },
+];
+
+const SAVE_KEY = 'glasmacher_save_v1';
+
+let save = {
+  money: 0, unlocked: ['clear', 'sea'], done: 0, fail: 0, best: 0,
+  up: { tongs: 0, hose: 0, gauge: 0 },
+};
+
+function loadSave() {
+  try {
+    const raw = localStorage.getItem(SAVE_KEY);
+    if (raw) {
+      const s = JSON.parse(raw);
+      if (s && typeof s.money === 'number') {
+        save = { ...save, ...s, up: { ...save.up, ...(s.up || {}) } };
+      }
+    }
+  } catch (e) {}
+}
+function persist() {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {}
+}
+
+/* ============================== state ============================== */
+
+const PHASE_TITLE = 'title';
+const PHASE_SHOP = 'shop';
+const PHASE_HEAT = 'heat';
+const PHASE_BLOW = 'blow';
+const PHASE_SHAPE = 'shape';
+const PHASE_ANNEAL = 'anneal';
+const PHASE_RESULT = 'result';
+
+const game = {
+  phase: PHASE_TITLE,
+  time: 0,
+  holding: false,
+  order: null,
+  temp: 0,
+  size: 0,
+  scores: {},
+  tapsDone: 0,
+  zones: [],
+  pointer: 0.5,
+  pointerDir: 1,
+  message: '',
+  sparks: [],
+  shards: [],
+  glow: 0,
+  shake: 0,
+  fail: false,
+  pay: 0,
+  rating: '',
+  clickable: [],
+};
+
+function makeOrder() {
+  const colors = save.unlocked.filter(k => COLORS[k]);
+  const shapeKeys = Object.keys(SHAPES).slice(0, clamp(1 + Math.floor(save.done / 2), 1, 4));
+  return {
+    color: pick(colors),
+    size: pick(Object.keys(SIZES)),
+    shape: pick(shapeKeys),
+  };
+}
+function orderPay(o) {
+  return COLORS[o.color].base * SIZES[o.size].mult * SHAPES[o.shape].mult;
+}
+
+function sparks(x, y, n, hue) {
+  for (let i = 0; i < n; i++) {
+    game.sparks.push({
+      x, y, vx: rand(-60, 60), vy: rand(-160, -30),
+      life: rand(0.3, 0.8), t: 0,
+      col: hue || (Math.random() < 0.5 ? '#ffcf6b' : '#ff9a3c'),
+    });
+  }
+}
+function shatter(x, y, colorKey) {
+  const c = COLORS[colorKey] || COLORS.clear;
+  for (let i = 0; i < 26; i++) {
+    game.shards.push({
+      x, y, vx: rand(-260, 260), vy: rand(-320, 60),
+      life: rand(0.5, 1.1), t: 0, r: rand(2, 5), col: c.glass,
+    });
+  }
+}
+
+/* ============================== phases ============================== */
+
+function goTitle() {
+  game.phase = PHASE_TITLE;
+}
+function goShop(fresh = true) {
+  game.phase = PHASE_SHOP;
+  game.fail = false;
+  if (fresh) game.order = makeOrder();
+}
+function startOrder() {
+  game.order = game.order || makeOrder();
+  game.temp = 0; game.size = 0;
+  game.scores = {}; game.tapsDone = 0;
+  game.sparks = []; game.shards = [];
+  game.pointer = 0.5; game.pointerDir = 1;
+  game.fail = false;
+  game.heatArmed = false;
+  game.phase = PHASE_HEAT;
+  beep(220, 0.15, 'triangle', 0.1);
+}
+function crackFail(msg) {
+  game.fail = true;
+  game.message = msg;
+  noiseBurst(0.35, 0.3);
+  shatter(W / 2, 370, game.order.color);
+  game.shake = 12;
+  finishOrder();
+}
+function popFail() {
+  game.fail = true;
+  game.message = 'POP! The bubble burst.';
+  noiseBurst(0.4, 0.35);
+  shatter(W / 2, 370, game.order.color);
+  game.shake = 14;
+  finishOrder();
+}
+function finishOrder() {
+  game.phase = PHASE_RESULT;
+  const o = game.order;
+  if (game.fail) {
+    game.pay = 0;
+    game.rating = 'Ruined';
+    game.scores = { heat: game.scores.heat || 0, blow: game.scores.blow || 0, shape: game.scores.shape || 0, anneal: game.scores.anneal || 0 };
+    save.fail++;
+  } else {
+    const q = quality(o);
+    game.pay = Math.round(orderPay(o) * q / 100);
+    if (q >= 92) game.pay = Math.round(game.pay * 1.25);
+    game.rating = q >= 92 ? 'Masterwork!' : q >= 80 ? 'Fine work' : q >= 60 ? 'Decent' : q >= 40 ? 'Rough' : 'Barely glass';
+    save.money += game.pay;
+    save.done++;
+    save.best = Math.max(save.best, q);
+    beep(520, 0.1, 'triangle', 0.12);
+    setTimeout(() => beep(660, 0.12, 'triangle', 0.12), 110);
+    if (q >= 92) setTimeout(() => beep(880, 0.2, 'triangle', 0.12), 240);
+  }
+  persist();
+}
+function quality(o) {
+  const s = game.scores;
+  return Math.round((s.heat + s.blow * 1.2 + s.shape + s.anneal) / 4.2);
+}
+
+function beginBlow() {
+  game.phase = PHASE_BLOW;
+  game.size = 8;
+  beep(300, 0.08, 'sine', 0.08);
+}
+function beginShape() {
+  game.phase = PHASE_SHAPE;
+  game.tapsDone = 0;
+  const n = SHAPES[game.order.shape].taps;
+  const widen = 1 + save.up.tongs * 0.35;
+  game.zones = [];
+  for (let i = 0; i < n; i++) {
+    const half = [0.17, 0.12, 0.085][i] * widen;
+    game.zones.push({ c: rand(0.3, 0.7), half });
+  }
+  beep(440, 0.08, 'square', 0.07);
+}
+function beginAnneal() {
+  game.phase = PHASE_ANNEAL;
+  game.temp = clamp(game.temp, 40, 95);
+  beep(180, 0.15, 'sine', 0.1);
+}
+
+/* ============================== input ============================== */
+
+function onPress() {
+  saveInteraction();
+  const ph = game.phase;
+  if (ph === PHASE_TITLE || ph === PHASE_RESULT) {
+    goShop(true);
+    beep(330, 0.08, 'triangle', 0.1);
+    return;
+  }
+  if (ph === PHASE_SHOP) {
+    if (mouse.x < 0) { startOrder(); return; }
+    for (const c of game.clickable) {
+      if (c.act && pointIn(c, mouse.x, mouse.y)) { c.act(); return; }
+    }
+    return;
+  }
+  if (ph === PHASE_HEAT) { game.heatArmed = true; return; }   // handled by hold/release
+  if (ph === PHASE_BLOW) return;                 // handled by hold/release
+  if (ph === PHASE_SHAPE) return shapeTap();
+  if (ph === PHASE_ANNEAL) return annealTap();
+}
+
+function shapeTap() {
+  const z = game.zones[game.tapsDone];
+  const dist = Math.abs(game.pointer - z.c);
+  let s;
+  if (dist <= z.half) s = Math.round(100 - (dist / z.half) * 45);
+  else { s = 8; game.shake = 6; beep(120, 0.15, 'sawtooth', 0.1); }
+  game.scores.shape = Math.round(((game.scores.shape || 0) * game.tapsDone + s) / (game.tapsDone + 1));
+  game.tapsDone++;
+  if (s > 8) beep(440 + game.tapsDone * 110, 0.07, 'square', 0.1);
+  sparks(W / 2 + rand(-30, 30), 340 + rand(-20, 20), 5, '#bfe8ff');
+  if (game.tapsDone >= game.zones.length) {
+    setTimeout(() => { if (game.phase === '_shaping') beginAnneal(); }, 350);
+    game.phase = '_shaping';
+  }
+}
+
+function annealTap() {
+  const t = game.temp;
+  let s;
+  if (t >= 45 && t <= 62) s = Math.round(100 - Math.abs(t - 53) * 2.2);
+  else if (t > 70) { s = 22; game.shake = 6; }
+  else s = 15;
+  game.scores.anneal = s;
+  beep(240, 0.12, 'sine', 0.1);
+  finishOrder();
+}
+
+function onRelease() {
+  saveInteraction();
+  const ph = game.phase;
+  if (ph === PHASE_HEAT) {
+    if (!game.heatArmed) return;
+    game.heatArmed = false;
+    const t = game.temp;
+    if (t >= 108) return crackFail('The gather dripped off the pipe!');
+    const err = Math.abs(t - 80);
+    game.scores.heat = Math.round(clamp(100 - Math.max(0, err - 10) * 4, 0, 100));
+    beginBlow();
+    return;
+  }
+  if (ph === PHASE_BLOW) {
+    const target = SIZES[game.order.size].target;
+    const err = Math.abs(game.size - target);
+    game.scores.blow = Math.round(clamp(100 - Math.max(0, err - 7) * 5, 0, 100));
+    beginShape();
+  }
+}
+
+const mouse = { x: 0, y: 0 };
+function canvasPos(e) {
+  const r = cvs.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * (W / r.width), y: (e.clientY - r.top) * (H / r.height) };
+}
+function pointIn(rect, x, y) {
+  return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
+}
+function saveInteraction() {
+  if (audio() && AC.state === 'suspended') AC.resume();
+}
+cvs.addEventListener('pointerdown', e => {
+  const p = canvasPos(e);
+  mouse.x = p.x; mouse.y = p.y;
+  game.holding = true;
+  onPress();
+});
+window.addEventListener('pointerup', () => { game.holding = false; onRelease(); });
+window.addEventListener('keydown', e => {
+  if (e.repeat) return;
+  if (e.code === 'Space' || e.code === 'Enter') {
+    e.preventDefault();
+    mouse.x = -1; mouse.y = -1;
+    game.holding = true;
+    onPress();
+  }
+});
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space' || e.code === 'Enter') { game.holding = false; onRelease(); }
+});
+
+/* ============================== update ============================== */
+
+function update(dt) {
+  game.time += dt;
+  game.shake = Math.max(0, game.shake - dt * 30);
+  game.glow = lerp(game.glow, (game.phase === PHASE_HEAT && game.holding) ? 1 : 0.45, dt * 4);
+
+  for (let i = game.sparks.length - 1; i >= 0; i--) {
+    const s = game.sparks[i];
+    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 340 * dt;
+    if (s.t > s.life) game.sparks.splice(i, 1);
+  }
+  for (let i = game.shards.length - 1; i >= 0; i--) {
+    const s = game.shards[i];
+    s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 900 * dt;
+    if (s.t > s.life) game.shards.splice(i, 1);
+  }
+
+  const coolRate = 11 * (1 - save.up.hose * 0.13);
+  const ph = game.phase;
+
+  if (ph === PHASE_HEAT) {
+    if (game.holding) {
+      game.temp += dt * 46 * (1 + game.temp / 130);
+      if (game.temp > 70 && Math.random() < dt * 22) sparks(rand(150, 240), rand(300, 330), 1);
+      if (game.temp >= 110) {
+        game.temp = 110;
+        crackFail('Too hot — the gather collapsed!');
+      }
+    }
+  } else if (ph === PHASE_BLOW) {
+    game.temp = Math.max(0, game.temp - dt * coolRate);
+    if (!game.holding && game.temp < 4) return crackFail('Left too long — the glass went cold and cracked!');
+    if (game.holding) {
+      game.size += dt * 30 * (0.55 + game.temp / 160);
+      if (Math.random() < dt * 6) sparks(W / 2 + rand(-20, 20), 370, 1, '#cfeaf4');
+      if (game.temp < 18) return crackFail('Too cold — the glass cracked!');
+      if (game.size > SIZES[game.order.size].target * 1.38) return popFail();
+    }
+  } else if (ph === PHASE_SHAPE || ph === '_shaping') {
+    game.temp = Math.max(0, game.temp - dt * coolRate * 0.8);
+    const speed = 0.5 + 0.28 * game.tapsDone;
+    if (ph === PHASE_SHAPE) {
+      game.pointer += game.pointerDir * dt * speed;
+      if (game.pointer > 1) { game.pointer = 1; game.pointerDir = -1; }
+      if (game.pointer < 0) { game.pointer = 0; game.pointerDir = 1; }
+    }
+    if (game.temp < 10 && !game.fail) return crackFail('Too cold — the glass cracked while shaping!');
+  } else if (ph === PHASE_ANNEAL) {
+    game.temp = Math.max(0, game.temp - dt * 42);
+  }
+}
+
+/* ============================== drawing ============================== */
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#221a14');
+  g.addColorStop(0.65, '#17110c');
+  g.addColorStop(1, '#0d0a08');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.fillStyle = '#241a12';
+  ctx.fillRect(0, 470, W, H - 470);
+  ctx.fillStyle = 'rgba(255,190,110,0.05)';
+  ctx.fillRect(0, 470, W, 4);
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    ctx.beginPath();
+    ctx.moveTo(0, 500 + i * 28);
+    ctx.lineTo(W, 500 + i * 28);
+    ctx.stroke();
+  }
+}
+
+function drawFurnace() {
+  const fx = 190, fy = 340;
+  const glow = game.glow;
+
+  const rg = ctx.createRadialGradient(fx, fy - 30, 10, fx, fy - 30, 260);
+  rg.addColorStop(0, `rgba(255,140,40,${0.28 * glow})`);
+  rg.addColorStop(1, 'rgba(255,140,40,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(fx - 260, fy - 290, 520, 520);
+
+  ctx.fillStyle = '#3a2a1c';
+  roundRect(fx - 110, fy - 160, 220, 230, 24);
+  ctx.fill();
+  ctx.fillStyle = '#25180e';
+  roundRect(fx - 92, fy - 142, 184, 194, 18);
+  ctx.fill();
+
+  const og = ctx.createRadialGradient(fx, fy - 30, 4, fx, fy - 30, 90);
+  og.addColorStop(0, `rgba(255,220,140,${0.95 * glow})`);
+  og.addColorStop(0.4, `rgba(255,140,40,${0.85 * glow})`);
+  og.addColorStop(1, 'rgba(120,40,10,0.1)');
+  ctx.fillStyle = og;
+  roundRect(fx - 70, fy - 100, 140, 150, 40);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(fx - 70, fy - 100, 140, 12);
+
+  ctx.fillStyle = '#120c08';
+  ctx.font = '13px Georgia';
+  ctx.textAlign = 'center';
+  ctx.fillText('GLORY HOLE', fx, fy + 96);
+}
+
+function drawPipe() {
+  const gx = W / 2, gy = 370;
+  ctx.strokeStyle = '#5a5a63';
+  ctx.lineWidth = 9;
+  ctx.beginPath();
+  ctx.moveTo(gx, gy);
+  ctx.lineTo(W - 40, gy);
+  ctx.stroke();
+  ctx.strokeStyle = '#8a6a40';
+  ctx.lineWidth = 16;
+  ctx.beginPath();
+  ctx.moveTo(W - 150, gy);
+  ctx.lineTo(W - 40, gy);
+  ctx.stroke();
+  ctx.strokeStyle = '#3d3d44';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(gx, gy - 8);
+  ctx.lineTo(gx, gy + 8);
+  ctx.stroke();
+}
+
+function tempColor(t) {
+  if (t > 100) return [255, 240, 200];
+  if (t > 80) return [255, 200, 110];
+  if (t > 55) return [255, 150, 60];
+  if (t > 30) return [230, 100, 50];
+  return [170, 70, 50];
+}
+
+function drawMoltenGather() {
+  const c = COLORS[game.order.color];
+  const t = game.temp;
+  const [r, g, b] = tempColor(t);
+  const coldMix = clamp((60 - t) / 60, 0, 1);
+  const gx = W / 2, gy = 370;
+  const rad = 13 + game.size * (game.phase === PHASE_BLOW || game.phase === PHASE_SHAPE || game.phase === '_shaping' ? 1 : 0.4);
+
+  ctx.save();
+  if (t > 40) {
+    const rg = ctx.createRadialGradient(gx, gy, 5, gx, gy, rad + 46);
+    rg.addColorStop(0, `rgba(255,160,60,${0.35 * Math.min(1, t / 90)})`);
+    rg.addColorStop(1, 'rgba(255,160,60,0)');
+    ctx.fillStyle = rg;
+    ctx.fillRect(gx - rad - 60, gy - rad - 60, (rad + 60) * 2, (rad + 60) * 2);
+  }
+
+  const base = coldMix < 0.9 ? `rgba(${Math.round(lerp(r, 120, coldMix))},${Math.round(lerp(g, 190, coldMix))},${Math.round(lerp(b, 210, coldMix))},0.88)` : c.glass;
+
+  if (game.phase === PHASE_SHAPE || game.phase === '_shaping') {
+    const p = clamp(game.tapsDone / Math.max(1, game.zones.length), 0, 1);
+    drawMorph(gx, gy, base, game.order.shape, SIZES[game.order.size].target, p);
+  } else {
+    const wob = Math.sin(game.time * 5) * (game.phase === PHASE_BLOW && game.holding ? 3 : 1);
+    ctx.beginPath();
+    ctx.ellipse(gx, gy, rad + wob * 0.5, rad - wob * 0.5, 0, 0, Math.PI * 2);
+    ctx.fillStyle = base;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.ellipse(gx - rad * 0.3, gy - rad * 0.35, rad * 0.25, rad * 0.18, -0.6, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawMorph(cx, cy, col, shape, target, p) {
+  const dims = shapeDims(shape, target);
+  const r0 = 13 + 8;
+  const rx = lerp(r0, dims.w / 2, p);
+  const ry = lerp(r0, dims.h / 2, p);
+  const wob = (1 - p) * Math.sin(game.time * 5) * 2;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, rx + wob, ry - wob, 0, 0, Math.PI * 2);
+  ctx.fillStyle = col;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx - rx * 0.3, cy - ry * 0.35, rx * 0.25, ry * 0.18, -0.6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fill();
+}
+
+function shapeDims(shape, size) {
+  switch (shape) {
+    case 'ornament': return { w: size * 2.0, h: size * 2.0 };
+    case 'bottle':   return { w: size * 1.5, h: size * 2.6 };
+    case 'bowl':     return { w: size * 2.3, h: size * 1.35 };
+    case 'vase':     return { w: size * 1.8, h: size * 2.4 };
+  }
+  return { w: size * 2, h: size * 2 };
+}
+
+function drawPiece(cx, cy, colorKey, shape, size, cracked, alpha) {
+  const c = COLORS[colorKey];
+  const dims = shapeDims(shape, size);
+  const w = dims.w, h = dims.h;
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+
+  const rg = ctx.createRadialGradient(cx, cy, 4, cx, cy, Math.max(w, h));
+  rg.addColorStop(0, 'rgba(255,220,160,0.14)');
+  rg.addColorStop(1, 'rgba(255,220,160,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(cx - w, cy - h, w * 2, h * 2);
+
+  ctx.fillStyle = c.glass;
+  ctx.strokeStyle = c.dark;
+  ctx.lineWidth = 3;
+
+  if (shape === 'ornament') {
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, w / 2, h / 2, 0, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.lite;
+    roundRect(cx - 9, cy - h / 2 - 16, 18, 18, 4);
+    ctx.fill();
+  } else if (shape === 'bottle') {
+    const nw = w * 0.34, bh = h * 0.72, nh = h - bh;
+    ctx.beginPath();
+    ctx.moveTo(cx - nw / 2, cy - h / 2);
+    ctx.lineTo(cx - nw / 2, cy + bh / 2 - h / 2 + nh * 0.25);
+    ctx.quadraticCurveTo(cx - nw / 2, cy + bh / 2 - h / 2 + nh * 0.5, cx - w / 2, cy + bh / 2 - h / 2 + nh * 0.25 + nh * 0.25);
+    ctx.lineTo(cx - w / 2 + 6, cy + h / 2 - 8);
+    ctx.quadraticCurveTo(cx, cy + h / 2 + 6, cx + w / 2 - 6, cy + h / 2 - 8);
+    ctx.lineTo(cx + w / 2, cy + bh / 2 - h / 2 + nh * 0.5);
+    ctx.quadraticCurveTo(cx + nw / 2, cy + bh / 2 - h / 2 + nh * 0.5, cx + nw / 2, cy + bh / 2 - h / 2 + nh * 0.25);
+    ctx.lineTo(cx + nw / 2, cy - h / 2);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.lite;
+    roundRect(cx - nw / 2 - 5, cy - h / 2 - 8, nw + 10, 10, 3);
+    ctx.fill();
+  } else if (shape === 'bowl') {
+    ctx.beginPath();
+    ctx.moveTo(cx - w / 2, cy - h / 2);
+    ctx.bezierCurveTo(cx - w / 2 + 4, cy + h / 2, cx + w / 2 - 4, cy + h / 2, cx + w / 2, cy - h / 2);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.lite;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy - h / 2, w / 2, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    const nk = w * 0.30;
+    ctx.beginPath();
+    ctx.moveTo(cx - nk, cy - h / 2);
+    ctx.bezierCurveTo(cx - nk - 8, cy - h / 2 + h * 0.16, cx - w / 2 + 2, cy - h * 0.05, cx - w / 2, cy + h * 0.25);
+    ctx.bezierCurveTo(cx - w / 2 + 4, cy + h / 2 - 6, cx + w / 2 - 4, cy + h / 2 - 6, cx + w / 2, cy + h * 0.25);
+    ctx.bezierCurveTo(cx + w / 2 - 2, cy - h * 0.05, cx + nk + 8, cy - h / 2 + h * 0.16, cx + nk, cy - h / 2);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = c.lite;
+    roundRect(cx - nk - 8, cy - h / 2 - 8, nk * 2 + 16, 12, 5);
+    ctx.fill();
+  }
+
+  ctx.beginPath();
+  ctx.ellipse(cx - w * 0.16, cy - h * 0.18, w * 0.13, h * 0.2, -0.5, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fill();
+
+  if (cracked) {
+    ctx.strokeStyle = 'rgba(20,25,35,0.85)';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(cx - w * 0.2, cy - h * 0.3);
+    ctx.lineTo(cx - w * 0.05, cy - h * 0.05);
+    ctx.lineTo(cx - w * 0.18, cy + h * 0.25);
+    ctx.lineTo(cx + w * 0.25, cy + h * 0.1);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawGauge(x, y, w, h, frac, zones, markerCol, label) {
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  roundRect(x - 2, y - 2, w + 4, h + 4, 8);
+  ctx.fill();
+  ctx.fillStyle = '#1c1510';
+  roundRect(x, y, w, h, 6);
+  ctx.fill();
+
+  for (const z of zones || []) {
+    ctx.fillStyle = 'rgba(120,220,140,0.28)';
+    roundRect(x + z.c * w - z.half * w, y, z.half * 2 * w, h, 5);
+    ctx.fill();
+  }
+  ctx.fillStyle = markerCol;
+  roundRect(x + frac * w - 3, y - 5, 6, h + 10, 3);
+  ctx.fill();
+  if (label) {
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font = '12px Georgia';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x + w / 2, y - 10);
+  }
+}
+
+function drawParticles() {
+  for (const s of game.sparks) {
+    ctx.globalAlpha = clamp(1 - s.t / s.life, 0, 1);
+    ctx.fillStyle = s.col;
+    ctx.fillRect(s.x, s.y, 3, 3);
+  }
+  for (const s of game.shards) {
+    ctx.globalAlpha = clamp(1 - s.t / s.life, 0, 1);
+    ctx.fillStyle = s.col;
+    ctx.beginPath();
+    ctx.moveTo(s.x, s.y);
+    ctx.lineTo(s.x + s.r, s.y + s.r * 1.5);
+    ctx.lineTo(s.x - s.r, s.y + s.r);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawHUD() {
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 20px Georgia';
+  ctx.fillStyle = '#ffdf9e';
+  ctx.fillText(fmt(save.money), 30, 40);
+  ctx.font = '13px Georgia';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('pieces sold: ' + save.done + '   wrecked: ' + save.fail, 30, 62);
+
+  const o = game.order;
+  if (o) {
+    const bx = W - 220, by = 18;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    roundRect(bx, by, 200, 92, 10);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,223,158,0.35)';
+    ctx.lineWidth = 1.5;
+    roundRect(bx, by, 200, 92, 10);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,223,158,0.9)';
+    ctx.font = '13px Georgia';
+    ctx.textAlign = 'left';
+    ctx.fillText('ORDER', bx + 14, by + 22);
+    ctx.font = 'bold 16px Georgia';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(SHAPES[o.shape].name, bx + 14, by + 46);
+    ctx.font = '13px Georgia';
+    ctx.fillStyle = COLORS[o.color].lite;
+    ctx.beginPath();
+    ctx.arc(bx + 22, by + 66, 7, 0, Math.PI * 2);
+    ctx.fillStyle = COLORS[o.color].glass;
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText(COLORS[o.color].name + ' · ' + SIZES[o.size].name, bx + 36, by + 71);
+    ctx.fillStyle = '#ffdf9e';
+    ctx.textAlign = 'right';
+    ctx.fillText(fmt(orderPay(o)), bx + 186, by + 46);
+  }
+  ctx.textAlign = 'left';
+}
+
+function drawHint(text, sub) {
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,246,220,0.95)';
+  ctx.font = 'bold 22px Georgia';
+  ctx.fillText(text, W / 2, 140);
+  if (sub) {
+    ctx.font = '15px Georgia';
+    ctx.fillStyle = 'rgba(255,246,220,0.6)';
+    ctx.fillText(sub, W / 2, 166);
+  }
+}
+
+/* -------- screens -------- */
+
+function drawTitle() {
+  drawBackground();
+  const flicker = 0.5 + Math.sin(game.time * 2) * 0.1;
+  const rg = ctx.createRadialGradient(W / 2, 300, 20, W / 2, 300, 320);
+  rg.addColorStop(0, `rgba(255,150,50,${0.3 * flicker})`);
+  rg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rg;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 74px Georgia';
+  const g = ctx.createLinearGradient(0, 210, 0, 300);
+  g.addColorStop(0, '#fff3d0');
+  g.addColorStop(1, '#ffab4a');
+  ctx.fillStyle = g;
+  ctx.fillText('GLASMACHER', W / 2, 280);
+  ctx.font = 'italic 20px Georgia';
+  ctx.fillStyle = 'rgba(255,246,220,0.7)';
+  ctx.fillText('a glassblowing game', W / 2, 316);
+
+  const lines = [
+    'Heat the gather · blow it to size · shape it on the bench · anneal it in the kiln.',
+    'Hold or click to act. Earn coins, unlock new colors, buy better tools.',
+  ];
+  ctx.font = '16px Georgia';
+  ctx.fillStyle = 'rgba(255,246,220,0.75)';
+  ctx.fillText(lines[0], W / 2, 450);
+  ctx.fillText(lines[1], W / 2, 476);
+
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
+  ctx.fillText('click or press Space to enter the workshop', W / 2, 560);
+}
+
+function button(x, y, w, h, text, enabled, act) {
+  game.clickable.push({ x, y, w, h, act: enabled ? act : null });
+  ctx.fillStyle = enabled ? 'rgba(255,180,80,0.16)' : 'rgba(255,255,255,0.04)';
+  roundRect(x, y, w, h, 8);
+  ctx.fill();
+  ctx.strokeStyle = enabled ? 'rgba(255,200,120,0.55)' : 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1.5;
+  roundRect(x, y, w, h, 8);
+  ctx.stroke();
+  ctx.fillStyle = enabled ? '#ffe6b0' : 'rgba(255,255,255,0.3)';
+  ctx.font = '14px Georgia';
+  ctx.textAlign = 'center';
+  ctx.fillText(text, x + w / 2, y + h / 2 + 5);
+}
+
+function drawShop() {
+  game.clickable = [];
+  drawBackground();
+  drawHUD();
+
+  const o = game.order;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 26px Georgia';
+  ctx.fillStyle = '#ffdf9e';
+  ctx.fillText('The Workshop', W / 2, 120);
+
+  ctx.font = '16px Georgia';
+  ctx.fillStyle = 'rgba(255,255,255,0.8)';
+  ctx.fillText(`New order: a ${SIZES[o.size].name.toLowerCase()} ${COLORS[o.color].name.toLowerCase()} ${SHAPES[o.shape].name.toLowerCase()} for ${fmt(orderPay(o))}`, W / 2, 154);
+
+  drawPiece(W / 2, 280, o.color, o.shape, SIZES[o.size].target, false);
+
+  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillText('click Take the order or press Space', W / 2, 428);
+  button(W / 2 - 110, 446, 220, 40, '🔥 Take the order', true, () => startOrder());
+
+  ctx.font = 'bold 15px Georgia';
+  ctx.fillStyle = '#ffdf9e';
+  ctx.fillText('TOOLSHOP', 70, 500);
+  ctx.font = '13px Georgia';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('colors are unlocked with the same buttons', 70, 519 + 0);
+
+  const uy = 534;
+  let ux = 40;
+  for (const up of UPGRADES) {
+    const lvl = save.up[up.key];
+    const maxed = lvl >= up.costs.length;
+    const cost = maxed ? 0 : up.costs[lvl];
+    const afford = save.money >= cost && !maxed;
+    button(ux, uy, 205, 66,
+      maxed ? `${up.name} — FULL` : `${up.name}  ${fmt(cost)}`,
+      afford,
+      () => { save.money -= cost; save.up[up.key]++; persist(); beep(600, 0.1, 'triangle', 0.1); });
+    ctx.font = '12px Georgia';
+    ctx.fillStyle = maxed ? 'rgba(160,220,160,0.7)' : 'rgba(255,255,255,0.55)';
+    ctx.fillText(up.desc, ux + 102, uy + 82);
+    ux += 225;
+  }
+
+  const cx = 717;
+  ctx.font = 'bold 15px Georgia';
+  ctx.fillStyle = '#ffdf9e';
+  ctx.fillText('GLASS COLORS', cx, 500);
+  let cy = 520;
+  for (const key of Object.keys(COLORS)) {
+    const c = COLORS[key];
+    const owned = save.unlocked.includes(key);
+    const afford = save.money >= c.price;
+    button(cx, cy, 205, 30,
+      owned ? `${c.name} ✓` : `${c.name}  ${fmt(c.price)}`,
+      owned || (afford && save.unlocked.length < Object.keys(COLORS).length),
+      owned ? null : () => { save.money -= c.price; save.unlocked.push(key); persist(); beep(700, 0.12, 'triangle', 0.12); });
+    cy += 38;
+  }
+}
+
+function drawHeat() {
+  drawBackground();
+  drawFurnace();
+  drawPipe();
+  drawMoltenGather();
+  drawParticles();
+  drawHUD();
+
+  const tempFrac = clamp(game.temp / 110, 0, 1);
+  drawGauge(W / 2 - 220, 500, 440, 26, tempFrac,
+    [{ c: 80 / 110, half: 10 / 110 }], '#ffcf6b', 'FURNACE HEAT — release in the green zone');
+
+  drawHint('Hold to heat the gather', 'release inside the green zone · too hot and it drips off the pipe');
+}
+
+function drawBlow() {
+  drawBackground();
+  drawFurnace();
+  drawPipe();
+  drawMoltenGather();
+  drawParticles();
+  drawHUD();
+
+  const target = SIZES[game.order.size].target;
+  const maxR = target * 1.38;
+  const zones = save.up.gauge > 0 ? [{ c: target / maxR, half: 9 / maxR }] : [];
+  const marker = save.up.gauge > 0 ? 'Bubble size' : 'Bubble size — calipers would show the target';
+  drawGauge(W / 2 - 220, 500, 440, 26, clamp(game.size / maxR, 0, 1), zones, '#8fb8ff', marker);
+
+  if (game.temp < 30) {
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 18px Georgia';
+    ctx.fillStyle = `rgba(255,120,80,${0.5 + Math.sin(game.time * 10) * 0.25})`;
+    ctx.fillText('⚠ cooling fast — finish the blow!', W / 2, 450);
+  }
+  drawHint('Hold to blow the bubble', 'watch the size — overblow it and it pops · heat fades as you work');
+}
+
+function drawShape() {
+  drawBackground();
+  drawFurnace();
+  drawPipe();
+  drawMoltenGather();
+  drawParticles();
+  drawHUD();
+
+  const n = game.zones.length;
+  const done = game.tapsDone;
+  drawHint(done === 0 ? 'Shape the piece — tap in the green zones' : `Shaping… ${done}/${n} ${done === 1 ? 'pull' : 'pulls'} done`,
+    done === 0 ? 'each pull is scored — the pointer speeds up' : 'keep the rhythm');
+  if (game.phase === PHASE_SHAPE) {
+    const z = game.zones[done];
+    const myZones = [{ c: z.c, half: z.half }];
+    drawGauge(W / 2 - 220, 500, 440, 26, game.pointer, myZones, '#ffcf6b', `Pull ${done + 1} of ${n}`);
+  } else {
+    drawGauge(W / 2 - 220, 500, 440, 26, 1, [], '#8fd48f', 'Shaped!');
+  }
+}
+
+function drawAnneal() {
+  drawBackground();
+  drawFurnace();
+  drawPipe();
+  drawMoltenGather();
+  drawParticles();
+  drawHUD();
+
+  const frac = clamp(game.temp / 100, 0, 1);
+  drawGauge(W / 2 - 220, 500, 440, 26, frac,
+    [{ c: 0.535, half: 0.085 }], '#9fc4ff', 'KILN COOLING — tap to anneal inside the window');
+
+  drawHint('Anneal it', 'tap when the cooling marker is in the window — too hot or too cold invites cracks');
+}
+
+function drawResult() {
+  drawBackground();
+  drawHUD();
+
+  const o = game.order;
+  const q = game.fail ? 0 : quality(o);
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 30px Georgia';
+  ctx.fillStyle = game.fail ? '#ff8f6b' : '#ffdf9e';
+  ctx.fillText(game.fail ? 'Ruined!' : game.rating, W / 2, 150);
+
+  if (game.fail) {
+    ctx.font = '17px Georgia';
+    ctx.fillStyle = 'rgba(255,246,220,0.75)';
+    ctx.fillText(game.message, W / 2, 186);
+    ctx.fillStyle = '#1c1510';
+    ctx.beginPath();
+    ctx.ellipse(W / 2, 450, 60, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+  } else {
+    drawPiece(W / 2, 340, o.color, o.shape, SIZES[o.size].target, q < 40);
+    ctx.font = '17px Georgia';
+    ctx.fillStyle = 'rgba(255,246,220,0.85)';
+    ctx.fillText(`quality ${q}/100`, W / 2, 450);
+    ctx.font = 'bold 26px Georgia';
+    ctx.fillStyle = '#9fe8a8';
+    ctx.fillText('+' + fmt(game.pay) + (q >= 92 ? '  (masterwork bonus!)' : ''), W / 2, 490);
+  }
+
+  ctx.font = `bold 18px Georgia`;
+  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
+  ctx.fillText('click or press Space for the next order', W / 2, 560);
+}
+
+/* ============================== main loop ============================== */
+
+function render() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (game.shake > 0) {
+    ctx.translate(rand(-game.shake, game.shake) * 0.5, rand(-game.shake, game.shake) * 0.5);
+  }
+  switch (game.phase) {
+    case PHASE_TITLE: drawTitle(); break;
+    case PHASE_SHOP: drawShop(); break;
+    case PHASE_HEAT: drawHeat(); break;
+    case PHASE_BLOW: drawBlow(); break;
+    case PHASE_SHAPE:
+    case '_shaping': drawShape(); break;
+    case PHASE_ANNEAL: drawAnneal(); break;
+    case PHASE_RESULT: drawResult(); break;
+  }
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+loadSave();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
