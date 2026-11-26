@@ -91,7 +91,7 @@ function playOrder(opts = {}) {
 playOrder();
 console.log('ORDER 1:', 'phase:', game.phase, 'fail:', game.fail, 'quality:', game.fail ? 0 : quality(game.order), 'pay:', game.pay);
 console.assert(game.phase === 'result' && !game.fail && game.pay > 0, 'order 1 should succeed');
-console.assert(store['glasmacher_save_v1'], 'save persisted');
+console.assert(store['glasmacher_save_v2'], 'save persisted');
 
 keydown(); keyup(); step(5);
 console.assert(game.phase === 'shop', 'back to shop, got ' + game.phase);

@@ -7,7 +7,7 @@
 <style>
   html, body {
     margin: 0; padding: 0; height: 100%;
-    background: #0d0a08;
+    background: #080604;
     display: flex; align-items: center; justify-content: center;
     overflow: hidden; touch-action: none;
     font-family: Georgia, 'Times New Roman', serif;
@@ -17,7 +17,7 @@
     aspect-ratio: 3 / 2;
     width: 100%;
     cursor: pointer;
-    border-radius: 6px;
+    box-shadow: 0 0 60px rgba(255,140,40,0.08);
   }
 </style>
 </head>
@@ -55,7 +55,7 @@ function beep(freq = 440, dur = 0.08, type = 'sine', vol = 0.12) {
   g.gain.exponentialRampToValueAtTime(0.001, now + dur);
   o.start(now); o.stop(now + dur);
 }
-function noiseBurst(dur = 0.3, vol = 0.25) {
+function noiseBurst(dur = 0.3, vol = 0.25, lowpass = 0) {
   const ac = audio(); if (!ac) return;
   const len = Math.floor(ac.sampleRate * dur);
   const buf = ac.createBuffer(1, len, ac.sampleRate);
@@ -63,7 +63,13 @@ function noiseBurst(dur = 0.3, vol = 0.25) {
   for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
   const src = ac.createBufferSource(), g = ac.createGain();
   src.buffer = buf;
-  src.connect(g); g.connect(ac.destination);
+  let node = src;
+  if (lowpass) {
+    const f = ac.createBiquadFilter();
+    f.type = 'lowpass'; f.frequency.value = lowpass;
+    src.connect(f); node = f;
+  }
+  node.connect(g); g.connect(ac.destination);
   g.gain.value = vol;
   src.start();
 }
@@ -93,15 +99,17 @@ const SHAPES = {
 };
 
 const UPGRADES = [
-  { key: 'tongs', name: 'Jacks',       desc: 'Wider shaping zones.', costs: [130, 340] },
-  { key: 'hose',  name: 'Blowhose',    desc: 'Glass cools slower.',  costs: [110, 280] },
-  { key: 'gauge', name: 'Calipers',    desc: 'Shows the exact target size while blowing.', costs: [160] },
+  { key: 'tongs', name: 'Jacks',    desc: 'Wider shaping zones.', costs: [130, 340] },
+  { key: 'hose',  name: 'Blowhose', desc: 'Glass cools slower.',  costs: [110, 280] },
+  { key: 'gauge', name: 'Calipers', desc: 'Shows the exact target size while blowing.', costs: [160] },
 ];
 
-const SAVE_KEY = 'glasmacher_save_v1';
+const ANN_WINDOW = { lo: 45, hi: 62, center: 53.5 };
+
+const SAVE_KEY = 'glasmacher_save_v2';
 
 let save = {
-  money: 0, unlocked: ['clear', 'sea'], done: 0, fail: 0, best: 0,
+  money: 0, unlocked: ['clear', 'sea'], done: 0, fail: 0, best: 0, streak: 0,
   up: { tongs: 0, hose: 0, gauge: 0 },
 };
 
@@ -134,6 +142,7 @@ const game = {
   phase: PHASE_TITLE,
   time: 0,
   holding: false,
+  heatArmed: false,
   order: null,
   temp: 0,
   size: 0,
@@ -145,13 +154,27 @@ const game = {
   message: '',
   sparks: [],
   shards: [],
-  glow: 0,
+  embers: [],
+  glow: 0.45,
   shake: 0,
   fail: false,
   pay: 0,
+  streakBonus: 0,
   rating: '',
   clickable: [],
+  ease: {},
+  moneyShown: 0,
+  whooshT: 0,
+  flash: 0,
 };
+
+function difficulty() {
+  return Math.min(1, save.done / 25);
+}
+function skillTitle() {
+  const d = save.done;
+  return d < 6 ? 'Apprentice' : d < 15 ? 'Journeyman' : d < 26 ? 'Artisan' : 'Master Glazier';
+}
 
 function makeOrder() {
   const colors = save.unlocked.filter(k => COLORS[k]);
@@ -163,9 +186,18 @@ function makeOrder() {
   };
 }
 function orderPay(o) {
-  return COLORS[o.color].base * SIZES[o.size].mult * SHAPES[o.shape].mult;
+  const diffBonus = 1 + 0.3 * difficulty();
+  return Math.round(COLORS[o.color].base * SIZES[o.size].mult * SHAPES[o.shape].mult * diffBonus);
 }
 
+function spawnEmber() {
+  game.embers.push({
+    x: rand(150, 240), y: rand(230, 290),
+    vx: rand(-14, 14), vy: rand(-46, -18),
+    life: rand(1.2, 2.6), t: 0, r: rand(1, 2.6),
+    col: Math.random() < 0.6 ? '#ffcf6b' : '#ff8f3c',
+  });
+}
 function sparks(x, y, n, hue) {
   for (let i = 0; i < n; i++) {
     game.sparks.push({
@@ -175,21 +207,25 @@ function sparks(x, y, n, hue) {
     });
   }
 }
+function sparkleAt(x, y) {
+  game.sparks.push({
+    x, y, vx: rand(-40, 40), vy: rand(-90, -20),
+    life: rand(0.4, 0.9), t: 0, r: rand(1.5, 3),
+    col: pick(['#fff3bf', '#ffd75e', '#ffffff']),
+  });
+}
 function shatter(x, y, colorKey) {
   const c = COLORS[colorKey] || COLORS.clear;
-  for (let i = 0; i < 26; i++) {
+  for (let i = 0; i < 30; i++) {
     game.shards.push({
-      x, y, vx: rand(-260, 260), vy: rand(-320, 60),
-      life: rand(0.5, 1.1), t: 0, r: rand(2, 5), col: c.glass,
+      x, y, vx: rand(-280, 280), vy: rand(-340, 60),
+      life: rand(0.5, 1.2), t: 0, r: rand(2, 6), col: c.glass,
     });
   }
 }
 
 /* ============================== phases ============================== */
 
-function goTitle() {
-  game.phase = PHASE_TITLE;
-}
 function goShop(fresh = true) {
   game.phase = PHASE_SHOP;
   game.fail = false;
@@ -212,19 +248,23 @@ function crackFail(msg) {
   noiseBurst(0.35, 0.3);
   shatter(W / 2, 370, game.order.color);
   game.shake = 12;
+  save.streak = 0;
   finishOrder();
 }
 function popFail() {
   game.fail = true;
   game.message = 'POP! The bubble burst.';
-  noiseBurst(0.4, 0.35);
+  noiseBurst(0.4, 0.35, 900);
   shatter(W / 2, 370, game.order.color);
   game.shake = 14;
+  game.flash = 0.5;
+  save.streak = 0;
   finishOrder();
 }
 function finishOrder() {
   game.phase = PHASE_RESULT;
   const o = game.order;
+  game.streakBonus = 0;
   if (game.fail) {
     game.pay = 0;
     game.rating = 'Ruined';
@@ -232,7 +272,11 @@ function finishOrder() {
     save.fail++;
   } else {
     const q = quality(o);
-    game.pay = Math.round(orderPay(o) * q / 100);
+    let pay = Math.round(orderPay(o) * q / 100);
+    if (q >= 70) { save.streak++; } else { save.streak = 0; }
+    const streakMult = 1 + 0.05 * Math.min(save.streak, 10);
+    game.streakBonus = Math.round(pay * (streakMult - 1));
+    game.pay = pay + game.streakBonus;
     if (q >= 92) game.pay = Math.round(game.pay * 1.25);
     game.rating = q >= 92 ? 'Masterwork!' : q >= 80 ? 'Fine work' : q >= 60 ? 'Decent' : q >= 40 ? 'Rough' : 'Barely glass';
     save.money += game.pay;
@@ -259,9 +303,10 @@ function beginShape() {
   game.tapsDone = 0;
   const n = SHAPES[game.order.shape].taps;
   const widen = 1 + save.up.tongs * 0.35;
+  const tighten = 1 - 0.18 * difficulty();
   game.zones = [];
   for (let i = 0; i < n; i++) {
-    const half = [0.17, 0.12, 0.085][i] * widen;
+    const half = [0.17, 0.12, 0.085][i] * widen * tighten;
     game.zones.push({ c: rand(0.3, 0.7), half });
   }
   beep(440, 0.08, 'square', 0.07);
@@ -275,7 +320,7 @@ function beginAnneal() {
 /* ============================== input ============================== */
 
 function onPress() {
-  saveInteraction();
+  if (audio() && AC.state === 'suspended') AC.resume();
   const ph = game.phase;
   if (ph === PHASE_TITLE || ph === PHASE_RESULT) {
     goShop(true);
@@ -289,8 +334,8 @@ function onPress() {
     }
     return;
   }
-  if (ph === PHASE_HEAT) { game.heatArmed = true; return; }   // handled by hold/release
-  if (ph === PHASE_BLOW) return;                 // handled by hold/release
+  if (ph === PHASE_HEAT) { game.heatArmed = true; return; }
+  if (ph === PHASE_BLOW) return;
   if (ph === PHASE_SHAPE) return shapeTap();
   if (ph === PHASE_ANNEAL) return annealTap();
 }
@@ -313,8 +358,9 @@ function shapeTap() {
 
 function annealTap() {
   const t = game.temp;
+  if (t < 22) return crackFail('Thermal shock! It shattered as it touched the kiln.');
   let s;
-  if (t >= 45 && t <= 62) s = Math.round(100 - Math.abs(t - 53) * 2.2);
+  if (t >= ANN_WINDOW.lo && t <= ANN_WINDOW.hi) s = Math.round(100 - Math.abs(t - ANN_WINDOW.center) * 2.2);
   else if (t > 70) { s = 22; game.shake = 6; }
   else s = 15;
   game.scores.anneal = s;
@@ -323,7 +369,7 @@ function annealTap() {
 }
 
 function onRelease() {
-  saveInteraction();
+  if (audio() && AC.state === 'suspended') AC.resume();
   const ph = game.phase;
   if (ph === PHASE_HEAT) {
     if (!game.heatArmed) return;
@@ -351,9 +397,6 @@ function canvasPos(e) {
 function pointIn(rect, x, y) {
   return x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h;
 }
-function saveInteraction() {
-  if (audio() && AC.state === 'suspended') AC.resume();
-}
 cvs.addEventListener('pointerdown', e => {
   const p = canvasPos(e);
   mouse.x = p.x; mouse.y = p.y;
@@ -379,7 +422,10 @@ window.addEventListener('keyup', e => {
 function update(dt) {
   game.time += dt;
   game.shake = Math.max(0, game.shake - dt * 30);
-  game.glow = lerp(game.glow, (game.phase === PHASE_HEAT && game.holding) ? 1 : 0.45, dt * 4);
+  game.flash = Math.max(0, game.flash - dt * 1.6);
+  const burning = game.phase === PHASE_HEAT && game.holding;
+  game.glow = lerp(game.glow, burning ? 1 : 0.45, dt * 4);
+  game.moneyShown = lerp(game.moneyShown, save.money, dt * 8);
 
   for (let i = game.sparks.length - 1; i >= 0; i--) {
     const s = game.sparks[i];
@@ -391,13 +437,40 @@ function update(dt) {
     s.t += dt; s.x += s.vx * dt; s.y += s.vy * dt; s.vy += 900 * dt;
     if (s.t > s.life) game.shards.splice(i, 1);
   }
+  for (let i = game.embers.length - 1; i >= 0; i--) {
+    const s = game.embers[i];
+    s.t += dt; s.x += s.vx * dt + Math.sin(game.time * 3 + s.y * 0.05) * 10 * dt;
+    s.y += s.vy * dt;
+    if (s.t > s.life) game.embers.splice(i, 1);
+  }
+  if (Math.random() < dt * 6) spawnEmber();
 
-  const coolRate = 11 * (1 - save.up.hose * 0.13);
+  const diff = difficulty();
+  const hoseFactor = 1 - save.up.hose * 0.13;
+  const coolRate = 11 * hoseFactor * (1 + 0.3 * diff);
+
+  if (game.phase === PHASE_HEAT && game.holding) {
+    game.whooshT += dt;
+    if (game.whooshT > 0.25) {
+      game.whooshT = 0;
+      noiseBurst(0.08, 0.03, 700);
+    }
+  }
+
+  if (game.phase === PHASE_BLOW && game.holding) {
+    game.whooshT += dt;
+    if (game.whooshT > 0.14) {
+      game.whooshT = 0;
+      noiseBurst(0.1, 0.035, 1400);
+    }
+  }
+
   const ph = game.phase;
 
   if (ph === PHASE_HEAT) {
     if (game.holding) {
-      game.temp += dt * 46 * (1 + game.temp / 130);
+      const flicker = 1 + Math.sin(game.time * 7) * 0.06 + Math.sin(game.time * 13.7) * 0.04;
+      game.temp += dt * 46 * flicker * (1 + game.temp / 130);
       if (game.temp > 70 && Math.random() < dt * 22) sparks(rand(150, 240), rand(300, 330), 1);
       if (game.temp >= 110) {
         game.temp = 110;
@@ -411,11 +484,12 @@ function update(dt) {
       game.size += dt * 30 * (0.55 + game.temp / 160);
       if (Math.random() < dt * 6) sparks(W / 2 + rand(-20, 20), 370, 1, '#cfeaf4');
       if (game.temp < 18) return crackFail('Too cold — the glass cracked!');
+      if (game.size > SIZES[game.order.size].target * 1.30) game.shake = Math.max(game.shake, 3);
       if (game.size > SIZES[game.order.size].target * 1.38) return popFail();
     }
   } else if (ph === PHASE_SHAPE || ph === '_shaping') {
     game.temp = Math.max(0, game.temp - dt * coolRate * 0.8);
-    const speed = 0.5 + 0.28 * game.tapsDone;
+    const speed = (0.5 + 0.28 * game.tapsDone) * (1 + 0.4 * diff);
     if (ph === PHASE_SHAPE) {
       game.pointer += game.pointerDir * dt * speed;
       if (game.pointer > 1) { game.pointer = 1; game.pointerDir = -1; }
@@ -423,11 +497,11 @@ function update(dt) {
     }
     if (game.temp < 10 && !game.fail) return crackFail('Too cold — the glass cracked while shaping!');
   } else if (ph === PHASE_ANNEAL) {
-    game.temp = Math.max(0, game.temp - dt * 42);
+    game.temp = Math.max(0, game.temp - dt * 42 * (1 + 0.35 * diff));
   }
 }
 
-/* ============================== drawing ============================== */
+/* ============================== drawing helpers ============================== */
 
 function roundRect(x, y, w, h, r) {
   ctx.beginPath();
@@ -439,27 +513,95 @@ function roundRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
+let wallPattern = null;
+function buildWall() {
+  const p = document.createElement('canvas');
+  p.width = 96; p.height = 48;
+  const pc = p.getContext('2d');
+  pc.fillStyle = '#28201a';
+  pc.fillRect(0, 0, 96, 48);
+  const drawBrick = (x, y, w, h, i) => {
+    const tone = 0.9 + (i % 7) * 0.02;
+    pc.fillStyle = `rgb(${Math.round(62 * tone)},${Math.round(48 * tone)},${Math.round(38 * tone)})`;
+    pc.fillRect(x + 1, y + 1, w - 2, h - 2);
+    pc.fillStyle = 'rgba(255,220,180,0.05)';
+    pc.fillRect(x + 1, y + 1, w - 2, 2);
+  };
+  drawBrick(0, 0, 46, 22, 0); drawBrick(48, 0, 46, 22, 1); drawBrick(94, 0, 2, 22, 7);
+  drawBrick(-24, 24, 46, 22, 2); drawBrick(24, 24, 46, 22, 3); drawBrick(72, 24, 46, 22, 4);
+  wallPattern = ctx.createPattern(p, 'repeat');
+}
+
 function drawBackground() {
-  const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, '#221a14');
-  g.addColorStop(0.65, '#17110c');
-  g.addColorStop(1, '#0d0a08');
-  ctx.fillStyle = g;
+  ctx.fillStyle = '#120d09';
   ctx.fillRect(0, 0, W, H);
+  if (!wallPattern && typeof document !== 'undefined' && document.createElement) buildWall();
+  if (wallPattern) {
+    ctx.fillStyle = wallPattern;
+    ctx.fillRect(0, 0, W, 480);
+  }
+
+  const wallShade = ctx.createLinearGradient(0, 0, 0, 480);
+  wallShade.addColorStop(0, 'rgba(0,0,0,0.55)');
+  wallShade.addColorStop(0.75, 'rgba(0,0,0,0.1)');
+  wallShade.addColorStop(1, 'rgba(0,0,0,0.45)');
+  ctx.fillStyle = wallShade;
+  ctx.fillRect(0, 0, W, 480);
+
+  drawTools();
 
   ctx.fillStyle = '#241a12';
-  ctx.fillRect(0, 470, W, H - 470);
-  ctx.fillStyle = 'rgba(255,190,110,0.05)';
-  ctx.fillRect(0, 470, W, 4);
-
-  ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-  ctx.lineWidth = 1;
+  ctx.fillRect(0, 480, W, H - 480);
+  ctx.fillStyle = 'rgba(255,190,110,0.07)';
+  ctx.fillRect(0, 480, W, 4);
   for (let i = 0; i < 5; i++) {
-    ctx.beginPath();
-    ctx.moveTo(0, 500 + i * 28);
-    ctx.lineTo(W, 500 + i * 28);
-    ctx.stroke();
+    ctx.fillStyle = i % 2 ? 'rgba(0,0,0,0.18)' : 'rgba(255,200,140,0.03)';
+    ctx.fillRect(0, 496 + i * 30, W, 28);
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.fillRect(0, 494 + i * 30, W, 2);
   }
+
+  const vg = ctx.createRadialGradient(W / 2, H / 2, H * 0.35, W / 2, H / 2, H * 0.95);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.5)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function drawTools() {
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 3;
+  const drawPaddle = (x, y) => {
+    ctx.beginPath();
+    ctx.ellipse(x, y + 26, 11, 22, 0, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + 4); ctx.lineTo(x, y + 50); ctx.stroke();
+    ctx.fillStyle = '#0d0906'; ctx.fillRect(x - 7, y - 8, 14, 8);
+  };
+  const drawJacks = (x, y) => {
+    ctx.beginPath();
+    ctx.moveTo(x - 16, y - 6); ctx.lineTo(x, y + 30);
+    ctx.moveTo(x + 16, y - 6); ctx.lineTo(x, y + 30);
+    ctx.moveTo(x - 16, y - 6); ctx.lineTo(x - 14, y - 16);
+    ctx.moveTo(x + 16, y - 6); ctx.lineTo(x + 14, y - 16);
+    ctx.stroke();
+  };
+  const drawShears = (x, y) => {
+    ctx.beginPath();
+    ctx.moveTo(x - 12, y + 26); ctx.lineTo(x + 4, y - 10);
+    ctx.moveTo(x + 12, y + 26); ctx.lineTo(x - 4, y - 10);
+    ctx.stroke();
+    ctx.beginPath(); ctx.arc(x - 10, y + 30, 5, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x + 10, y + 30, 5, 0, Math.PI * 2); ctx.stroke();
+  };
+  drawPaddle(560, 240); drawJacks(650, 250); drawShears(740, 248);
+}
+
+function easeMarker(id, frac, dt = 0.016) {
+  const cur = game.ease[id] == null ? frac : game.ease[id];
+  const next = lerp(cur, frac, dt * 14);
+  game.ease[id] = next;
+  return next;
 }
 
 function drawFurnace() {
@@ -472,50 +614,90 @@ function drawFurnace() {
   ctx.fillStyle = rg;
   ctx.fillRect(fx - 260, fy - 290, 520, 520);
 
-  ctx.fillStyle = '#3a2a1c';
-  roundRect(fx - 110, fy - 160, 220, 230, 24);
+  for (const e of game.embers) {
+    ctx.globalAlpha = clamp(1 - e.t / e.life, 0, 1) * 0.8;
+    ctx.fillStyle = e.col;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  const flick = 0.94 + Math.sin(game.time * 9) * 0.04 + Math.sin(game.time * 23.3) * 0.02;
+
+  ctx.fillStyle = '#3d2c1c';
+  ctx.beginPath();
+  ctx.moveTo(fx - 130, fy + 70);
+  ctx.lineTo(fx - 130, fy - 90);
+  ctx.quadraticCurveTo(fx, fy - 215, fx + 130, fy - 90);
+  ctx.lineTo(fx + 130, fy + 70);
+  ctx.closePath();
   ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+  ctx.lineWidth = 2;
+  for (let r = 0; r < 6; r++) {
+    const yy = fy - 96 + r * 27;
+    ctx.beginPath(); ctx.moveTo(fx - 128, yy); ctx.lineTo(fx + 128, yy); ctx.stroke();
+  }
+
   ctx.fillStyle = '#25180e';
-  roundRect(fx - 92, fy - 142, 184, 194, 18);
+  roundRect(fx - 100, fy - 150, 200, 216, 18);
   ctx.fill();
 
-  const og = ctx.createRadialGradient(fx, fy - 30, 4, fx, fy - 30, 90);
-  og.addColorStop(0, `rgba(255,220,140,${0.95 * glow})`);
-  og.addColorStop(0.4, `rgba(255,140,40,${0.85 * glow})`);
-  og.addColorStop(1, 'rgba(120,40,10,0.1)');
+  const breathe = glow * flick;
+  const og = ctx.createRadialGradient(fx, fy - 30, 4, fx, fy - 30, 95);
+  og.addColorStop(0, `rgba(255,240,190,${0.95 * breathe})`);
+  og.addColorStop(0.35, `rgba(255,160,50,${0.9 * breathe})`);
+  og.addColorStop(0.75, `rgba(190,60,15,${0.6 * breathe})`);
+  og.addColorStop(1, 'rgba(60,18,8,0.15)');
   ctx.fillStyle = og;
-  roundRect(fx - 70, fy - 100, 140, 150, 40);
+  roundRect(fx - 74, fy - 104, 148, 158, 38);
   ctx.fill();
 
-  ctx.fillStyle = 'rgba(0,0,0,0.45)';
-  ctx.fillRect(fx - 70, fy - 100, 140, 12);
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  roundRect(fx - 76, fy - 106, 152, 16, 6);
+  ctx.fill();
+  ctx.fillStyle = `rgba(255,220,150,${0.5 * glow})`;
+  roundRect(fx - 70, fy - 104, 140, 5, 2);
+  ctx.fill();
 
-  ctx.fillStyle = '#120c08';
-  ctx.font = '13px Georgia';
+  ctx.fillStyle = '#0c0906';
+  ctx.font = 'bold 11px Georgia';
   ctx.textAlign = 'center';
-  ctx.fillText('GLORY HOLE', fx, fy + 96);
+  ctx.save();
+  ctx.globalAlpha = 0.8;
+  ctx.fillText('GLORY HOLE', fx, fy + 98);
+  ctx.restore();
 }
 
 function drawPipe() {
-  const gx = W / 2, gy = 370;
-  ctx.strokeStyle = '#5a5a63';
+  const gy = 370;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(W / 2 - 20, gy + 14, W / 2 + 40, 7);
+  ctx.strokeStyle = '#43434c';
   ctx.lineWidth = 9;
   ctx.beginPath();
-  ctx.moveTo(gx, gy);
+  ctx.moveTo(W / 2, gy);
   ctx.lineTo(W - 40, gy);
   ctx.stroke();
-  ctx.strokeStyle = '#8a6a40';
+  ctx.strokeStyle = 'rgba(255,255,255,0.14)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(W / 2 + 6, gy - 2.5);
+  ctx.lineTo(W - 60, gy - 2.5);
+  ctx.stroke();
+  ctx.strokeStyle = '#7d5f38';
   ctx.lineWidth = 16;
   ctx.beginPath();
   ctx.moveTo(W - 150, gy);
   ctx.lineTo(W - 40, gy);
   ctx.stroke();
-  ctx.strokeStyle = '#3d3d44';
-  ctx.lineWidth = 4;
-  ctx.beginPath();
-  ctx.moveTo(gx, gy - 8);
-  ctx.lineTo(gx, gy + 8);
-  ctx.stroke();
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    const x = W - 60 - i * 30;
+    ctx.beginPath(); ctx.moveTo(x, gy - 8); ctx.lineTo(x, gy + 8); ctx.stroke();
+  }
 }
 
 function tempColor(t) {
@@ -526,13 +708,30 @@ function tempColor(t) {
   return [170, 70, 50];
 }
 
-function drawMoltenGather() {
-  const c = COLORS[game.order.color];
-  const t = game.temp;
-  const [r, g, b] = tempColor(t);
+function glassFill(t, colorKey) {
+  const c = COLORS[colorKey] || COLORS.clear;
   const coldMix = clamp((60 - t) / 60, 0, 1);
+  const [r, g, b] = tempColor(t);
+  return {
+    fill: `rgba(${Math.round(lerp(r, 150, coldMix))},${Math.round(lerp(g, 205, coldMix))},${Math.round(lerp(b, 225, coldMix))},${0.85 + 0.1 * (1 - coldMix)})`,
+    coldMix,
+  };
+}
+
+function drawPieceShadow(cx, cy, w) {
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + 10, w * 0.55, 10, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawMoltenGather() {
   const gx = W / 2, gy = 370;
+  const t = game.temp;
+  const { fill } = glassFill(t, game.order.color);
   const rad = 13 + game.size * (game.phase === PHASE_BLOW || game.phase === PHASE_SHAPE || game.phase === '_shaping' ? 1 : 0.4);
+
+  drawPieceShadow(gx, gy + rad - 6, rad);
 
   ctx.save();
   if (t > 40) {
@@ -543,39 +742,49 @@ function drawMoltenGather() {
     ctx.fillRect(gx - rad - 60, gy - rad - 60, (rad + 60) * 2, (rad + 60) * 2);
   }
 
-  const base = coldMix < 0.9 ? `rgba(${Math.round(lerp(r, 120, coldMix))},${Math.round(lerp(g, 190, coldMix))},${Math.round(lerp(b, 210, coldMix))},0.88)` : c.glass;
-
   if (game.phase === PHASE_SHAPE || game.phase === '_shaping') {
     const p = clamp(game.tapsDone / Math.max(1, game.zones.length), 0, 1);
-    drawMorph(gx, gy, base, game.order.shape, SIZES[game.order.size].target, p);
+    drawMorph(gx, gy, fill, game.order.shape, SIZES[game.order.size].target, p);
   } else {
     const wob = Math.sin(game.time * 5) * (game.phase === PHASE_BLOW && game.holding ? 3 : 1);
+    const grad = ctx.createRadialGradient(gx - rad * 0.3, gy - rad * 0.4, rad * 0.15, gx, gy, rad);
+    grad.addColorStop(0, 'rgba(255,255,255,0.85)');
+    grad.addColorStop(0.25, fill);
+    grad.addColorStop(1, t > 30 ? 'rgba(190,40,10,0.9)' : 'rgba(90,60,50,0.95)');
     ctx.beginPath();
     ctx.ellipse(gx, gy, rad + wob * 0.5, rad - wob * 0.5, 0, 0, Math.PI * 2);
-    ctx.fillStyle = base;
+    ctx.fillStyle = grad;
     ctx.fill();
+
+    ctx.strokeStyle = `rgba(255,180,90,${0.5 * Math.min(1, t / 80)})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
     ctx.beginPath();
-    ctx.ellipse(gx - rad * 0.3, gy - rad * 0.35, rad * 0.25, rad * 0.18, -0.6, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.ellipse(gx - rad * 0.32, gy - rad * 0.38, rad * 0.22, rad * 0.13, -0.7, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
     ctx.fill();
   }
   ctx.restore();
 }
 
-function drawMorph(cx, cy, col, shape, target, p) {
-  const dims = shapeDims(shape, target);
-  const r0 = 13 + 8;
+function drawMorph(cx, cy, col, shapeKey, target, p) {
+  const dims = shapeDims(shapeKey, target);
+  const r0 = 21;
   const rx = lerp(r0, dims.w / 2, p);
   const ry = lerp(r0, dims.h / 2, p);
   const wob = (1 - p) * Math.sin(game.time * 5) * 2;
+  const grad = ctx.createRadialGradient(cx - rx * 0.3, cy - ry * 0.4, Math.max(2, rx * 0.15), cx, cy, Math.max(rx, ry));
+  grad.addColorStop(0, 'rgba(255,255,255,0.7)');
+  grad.addColorStop(0.3, col);
+  grad.addColorStop(1, 'rgba(80,110,130,0.9)');
   ctx.beginPath();
   ctx.ellipse(cx, cy, rx + wob, ry - wob, 0, 0, Math.PI * 2);
-  ctx.fillStyle = col;
+  ctx.fillStyle = grad;
   ctx.fill();
-  ctx.beginPath();
-  ctx.ellipse(cx - rx * 0.3, cy - ry * 0.35, rx * 0.25, ry * 0.18, -0.6, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
 }
 
 function shapeDims(shape, size) {
@@ -588,36 +797,42 @@ function shapeDims(shape, size) {
   return { w: size * 2, h: size * 2 };
 }
 
-function drawPiece(cx, cy, colorKey, shape, size, cracked, alpha) {
+function drawPiece(cx, cy, colorKey, shapeKey, size, cracked, alpha) {
   const c = COLORS[colorKey];
-  const dims = shapeDims(shape, size);
+  const dims = shapeDims(shapeKey, size);
   const w = dims.w, h = dims.h;
   ctx.save();
   ctx.globalAlpha = alpha == null ? 1 : alpha;
 
+  drawPieceShadow(cx, cy + h / 2 + 6, w);
   const rg = ctx.createRadialGradient(cx, cy, 4, cx, cy, Math.max(w, h));
-  rg.addColorStop(0, 'rgba(255,220,160,0.14)');
+  rg.addColorStop(0, 'rgba(255,220,160,0.16)');
   rg.addColorStop(1, 'rgba(255,220,160,0)');
   ctx.fillStyle = rg;
   ctx.fillRect(cx - w, cy - h, w * 2, h * 2);
 
-  ctx.fillStyle = c.glass;
+  const grad = ctx.createLinearGradient(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2);
+  grad.addColorStop(0, c.lite);
+  grad.addColorStop(0.45, c.glass);
+  grad.addColorStop(1, c.dark);
+
+  ctx.fillStyle = grad;
   ctx.strokeStyle = c.dark;
   ctx.lineWidth = 3;
 
-  if (shape === 'ornament') {
+  if (shapeKey === 'ornament') {
     ctx.beginPath();
     ctx.ellipse(cx, cy, w / 2, h / 2, 0, 0, Math.PI * 2);
     ctx.fill(); ctx.stroke();
     ctx.fillStyle = c.lite;
     roundRect(cx - 9, cy - h / 2 - 16, 18, 18, 4);
     ctx.fill();
-  } else if (shape === 'bottle') {
+  } else if (shapeKey === 'bottle') {
     const nw = w * 0.34, bh = h * 0.72, nh = h - bh;
     ctx.beginPath();
     ctx.moveTo(cx - nw / 2, cy - h / 2);
     ctx.lineTo(cx - nw / 2, cy + bh / 2 - h / 2 + nh * 0.25);
-    ctx.quadraticCurveTo(cx - nw / 2, cy + bh / 2 - h / 2 + nh * 0.5, cx - w / 2, cy + bh / 2 - h / 2 + nh * 0.25 + nh * 0.25);
+    ctx.quadraticCurveTo(cx - nw / 2, cy + bh / 2 - h / 2 + nh * 0.5, cx - w / 2, cy + bh / 2 - h / 2 + nh * 0.5);
     ctx.lineTo(cx - w / 2 + 6, cy + h / 2 - 8);
     ctx.quadraticCurveTo(cx, cy + h / 2 + 6, cx + w / 2 - 6, cy + h / 2 - 8);
     ctx.lineTo(cx + w / 2, cy + bh / 2 - h / 2 + nh * 0.5);
@@ -628,7 +843,7 @@ function drawPiece(cx, cy, colorKey, shape, size, cracked, alpha) {
     ctx.fillStyle = c.lite;
     roundRect(cx - nw / 2 - 5, cy - h / 2 - 8, nw + 10, 10, 3);
     ctx.fill();
-  } else if (shape === 'bowl') {
+  } else if (shapeKey === 'bowl') {
     ctx.beginPath();
     ctx.moveTo(cx - w / 2, cy - h / 2);
     ctx.bezierCurveTo(cx - w / 2 + 4, cy + h / 2, cx + w / 2 - 4, cy + h / 2, cx + w / 2, cy - h / 2);
@@ -654,7 +869,7 @@ function drawPiece(cx, cy, colorKey, shape, size, cracked, alpha) {
 
   ctx.beginPath();
   ctx.ellipse(cx - w * 0.16, cy - h * 0.18, w * 0.13, h * 0.2, -0.5, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.fill();
 
   if (cracked) {
@@ -670,35 +885,59 @@ function drawPiece(cx, cy, colorKey, shape, size, cracked, alpha) {
   ctx.restore();
 }
 
-function drawGauge(x, y, w, h, frac, zones, markerCol, label) {
-  ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  roundRect(x - 2, y - 2, w + 4, h + 4, 8);
+function drawGauge(id, x, y, w, h, frac, zones, markerCol, label, danger) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.55)';
+  roundRect(x - 3, y - 3, w + 6, h + 6, 9);
   ctx.fill();
-  ctx.fillStyle = '#1c1510';
+  const track = ctx.createLinearGradient(x, y, x + w, y);
+  track.addColorStop(0, '#1e150e');
+  track.addColorStop(1, '#2a1d12');
+  ctx.fillStyle = track;
   roundRect(x, y, w, h, 6);
   ctx.fill();
 
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 10; i++) {
+    const tx = x + (i / 10) * w;
+    ctx.beginPath(); ctx.moveTo(tx, y + h - 5); ctx.lineTo(tx, y + h); ctx.stroke();
+  }
+
   for (const z of zones || []) {
-    ctx.fillStyle = 'rgba(120,220,140,0.28)';
-    roundRect(x + z.c * w - z.half * w, y, z.half * 2 * w, h, 5);
-    ctx.fill();
+    const zx = x + z.c * w - z.half * w;
+    const pulse = 0.26 + Math.sin(game.time * 6) * 0.08;
+    ctx.fillStyle = danger ? `rgba(255,120,90,${pulse})` : `rgba(120,225,145,${pulse})`;
+    ctx.strokeStyle = danger ? 'rgba(255,140,110,0.7)' : 'rgba(140,240,165,0.7)';
+    ctx.lineWidth = 1.5;
+    roundRect(zx, y, z.half * 2 * w, h, 5);
+    ctx.fill(); ctx.stroke();
   }
+
+  const ex = clamp(easeMarker(id, frac), 0, 1);
   ctx.fillStyle = markerCol;
-  roundRect(x + frac * w - 3, y - 5, 6, h + 10, 3);
+  roundRect(x + ex * w - 3.5, y - 5, 7, h + 10, 3.5);
   ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
   if (label) {
-    ctx.fillStyle = 'rgba(255,255,255,0.65)';
-    ctx.font = '12px Georgia';
+    ctx.fillStyle = 'rgba(255,246,220,0.75)';
+    ctx.font = 'bold 13px Georgia';
     ctx.textAlign = 'center';
-    ctx.fillText(label, x + w / 2, y - 10);
+    ctx.fillText(label, x + w / 2, y - 12);
   }
+  ctx.restore();
 }
 
 function drawParticles() {
   for (const s of game.sparks) {
     ctx.globalAlpha = clamp(1 - s.t / s.life, 0, 1);
     ctx.fillStyle = s.col;
-    ctx.fillRect(s.x, s.y, 3, 3);
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r || 1.6, 0, Math.PI * 2);
+    ctx.fill();
   }
   for (const s of game.shards) {
     ctx.globalAlpha = clamp(1 - s.t / s.life, 0, 1);
@@ -713,43 +952,58 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
+/* ============================== HUD & screens ============================== */
+
 function drawHUD() {
   ctx.textAlign = 'left';
-  ctx.font = 'bold 20px Georgia';
+  ctx.font = 'bold 22px Georgia';
   ctx.fillStyle = '#ffdf9e';
-  ctx.fillText(fmt(save.money), 30, 40);
+  ctx.fillText(fmt(game.moneyShown), 30, 42);
   ctx.font = '13px Georgia';
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.fillText('pieces sold: ' + save.done + '   wrecked: ' + save.fail, 30, 62);
+  ctx.fillText('pieces ' + save.done + '   wrecked ' + save.fail + '   best ' + save.best + '/100', 30, 64);
+  if (save.streak >= 2) {
+    ctx.fillStyle = '#ffb35c';
+    ctx.font = 'bold 14px Georgia';
+    ctx.fillText('🔥 streak ×' + save.streak + '  (+' + (5 * Math.min(save.streak, 10)) + '%)', 30, 86);
+  }
 
   const o = game.order;
   if (o) {
-    const bx = W - 220, by = 18;
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    roundRect(bx, by, 200, 92, 10);
+    const bx = W - 224, by = 18;
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.6)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 4;
+    ctx.fillStyle = 'rgba(20,12,6,0.85)';
+    roundRect(bx, by, 204, 96, 10);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(255,223,158,0.35)';
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(255,223,158,0.4)';
     ctx.lineWidth = 1.5;
-    roundRect(bx, by, 200, 92, 10);
+    roundRect(bx, by, 204, 96, 10);
     ctx.stroke();
     ctx.fillStyle = 'rgba(255,223,158,0.9)';
-    ctx.font = '13px Georgia';
+    ctx.font = 'bold 12px Georgia';
     ctx.textAlign = 'left';
-    ctx.fillText('ORDER', bx + 14, by + 22);
-    ctx.font = 'bold 16px Georgia';
+    ctx.fillText('— THE COMMISSION —', bx + 14, by + 24);
+    ctx.font = 'bold 17px Georgia';
     ctx.fillStyle = '#fff';
-    ctx.fillText(SHAPES[o.shape].name, bx + 14, by + 46);
-    ctx.font = '13px Georgia';
-    ctx.fillStyle = COLORS[o.color].lite;
+    ctx.fillText(SHAPES[o.shape].name, bx + 14, by + 47);
     ctx.beginPath();
-    ctx.arc(bx + 22, by + 66, 7, 0, Math.PI * 2);
+    ctx.arc(bx + 22, by + 68, 8, 0, Math.PI * 2);
     ctx.fillStyle = COLORS[o.color].glass;
     ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.8)';
-    ctx.fillText(COLORS[o.color].name + ' · ' + SIZES[o.size].name, bx + 36, by + 71);
+    ctx.strokeStyle = COLORS[o.color].dark;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.font = '13px Georgia';
+    ctx.fillText(COLORS[o.color].name + ' · ' + SIZES[o.size].name, bx + 37, by + 72);
     ctx.fillStyle = '#ffdf9e';
     ctx.textAlign = 'right';
-    ctx.fillText(fmt(orderPay(o)), bx + 186, by + 46);
+    ctx.font = 'bold 15px Georgia';
+    ctx.fillText(fmt(orderPay(o)), bx + 190, by + 72);
   }
   ctx.textAlign = 'left';
 }
@@ -760,123 +1014,144 @@ function drawHint(text, sub) {
   ctx.font = 'bold 22px Georgia';
   ctx.fillText(text, W / 2, 140);
   if (sub) {
-    ctx.font = '15px Georgia';
+    ctx.font = 'italic 15px Georgia';
     ctx.fillStyle = 'rgba(255,246,220,0.6)';
     ctx.fillText(sub, W / 2, 166);
   }
 }
 
-/* -------- screens -------- */
-
-function drawTitle() {
-  drawBackground();
-  const flicker = 0.5 + Math.sin(game.time * 2) * 0.1;
-  const rg = ctx.createRadialGradient(W / 2, 300, 20, W / 2, 300, 320);
-  rg.addColorStop(0, `rgba(255,150,50,${0.3 * flicker})`);
-  rg.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = rg;
-  ctx.fillRect(0, 0, W, H);
-
-  ctx.textAlign = 'center';
-  ctx.font = 'bold 74px Georgia';
-  const g = ctx.createLinearGradient(0, 210, 0, 300);
-  g.addColorStop(0, '#fff3d0');
-  g.addColorStop(1, '#ffab4a');
-  ctx.fillStyle = g;
-  ctx.fillText('GLASMACHER', W / 2, 280);
-  ctx.font = 'italic 20px Georgia';
-  ctx.fillStyle = 'rgba(255,246,220,0.7)';
-  ctx.fillText('a glassblowing game', W / 2, 316);
-
-  const lines = [
-    'Heat the gather · blow it to size · shape it on the bench · anneal it in the kiln.',
-    'Hold or click to act. Earn coins, unlock new colors, buy better tools.',
-  ];
-  ctx.font = '16px Georgia';
-  ctx.fillStyle = 'rgba(255,246,220,0.75)';
-  ctx.fillText(lines[0], W / 2, 450);
-  ctx.fillText(lines[1], W / 2, 476);
-
-  ctx.font = 'bold 18px Georgia';
-  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
-  ctx.fillText('click or press Space to enter the workshop', W / 2, 560);
-}
-
-function button(x, y, w, h, text, enabled, act) {
+function button(x, y, w, h, text, enabled, act, small) {
   game.clickable.push({ x, y, w, h, act: enabled ? act : null });
-  ctx.fillStyle = enabled ? 'rgba(255,180,80,0.16)' : 'rgba(255,255,255,0.04)';
+  const hot = enabled;
+  ctx.save();
+  if (hot) {
+    ctx.shadowColor = 'rgba(255,170,70,0.35)';
+    ctx.shadowBlur = 10;
+  }
+  ctx.fillStyle = hot ? 'rgba(255,180,80,0.18)' : 'rgba(255,255,255,0.04)';
   roundRect(x, y, w, h, 8);
   ctx.fill();
-  ctx.strokeStyle = enabled ? 'rgba(255,200,120,0.55)' : 'rgba(255,255,255,0.12)';
+  ctx.restore();
+  ctx.strokeStyle = hot ? 'rgba(255,200,120,0.6)' : 'rgba(255,255,255,0.12)';
   ctx.lineWidth = 1.5;
   roundRect(x, y, w, h, 8);
   ctx.stroke();
-  ctx.fillStyle = enabled ? '#ffe6b0' : 'rgba(255,255,255,0.3)';
-  ctx.font = '14px Georgia';
+  ctx.fillStyle = hot ? '#ffe6b0' : 'rgba(255,255,255,0.3)';
+  ctx.font = (small ? '13px' : '14px') + ' Georgia';
   ctx.textAlign = 'center';
   ctx.fillText(text, x + w / 2, y + h / 2 + 5);
+}
+
+function drawTitle() {
+  drawBackground();
+
+  for (const e of game.embers) {
+    ctx.globalAlpha = clamp(1 - e.t / e.life, 0, 1) * 0.8;
+    ctx.fillStyle = e.col;
+    ctx.beginPath();
+    ctx.arc(e.x + 300, e.y, e.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  ctx.textAlign = 'center';
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,150,50,0.55)';
+  ctx.shadowBlur = 30;
+  ctx.font = 'bold 76px Georgia';
+  const g = ctx.createLinearGradient(0, 210, 0, 300);
+  g.addColorStop(0, '#fff3d0');
+  g.addColorStop(1, '#ff9e3d');
+  ctx.fillStyle = g;
+  ctx.fillText('GLASMACHER', W / 2, 280);
+  ctx.restore();
+
+  ctx.font = 'italic 20px Georgia';
+  ctx.fillStyle = 'rgba(255,246,220,0.7)';
+  ctx.fillText('a glassblowing game', W / 2, 318);
+
+  drawPiece(W / 2, 410, 'sea', 'vase', 46, false, 0.95);
+
+  ctx.font = '15px Georgia';
+  ctx.fillStyle = 'rgba(255,246,220,0.7)';
+  ctx.fillText('heat · blow · shape · anneal — coins buy colors and finer tools', W / 2, 508);
+
+  ctx.font = 'bold 18px Georgia';
+  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
+  ctx.fillText('click or press Space to enter the workshop', W / 2, 566);
 }
 
 function drawShop() {
   game.clickable = [];
   drawBackground();
   drawHUD();
-
   const o = game.order;
+
   ctx.textAlign = 'center';
-  ctx.font = 'bold 26px Georgia';
+  ctx.save();
+  ctx.shadowColor = 'rgba(255,180,80,0.3)';
+  ctx.shadowBlur = 18;
+  ctx.font = 'bold 28px Georgia';
   ctx.fillStyle = '#ffdf9e';
-  ctx.fillText('The Workshop', W / 2, 120);
+  ctx.fillText('The Workshop', W / 2, 124);
+  ctx.restore();
 
-  ctx.font = '16px Georgia';
-  ctx.fillStyle = 'rgba(255,255,255,0.8)';
-  ctx.fillText(`New order: a ${SIZES[o.size].name.toLowerCase()} ${COLORS[o.color].name.toLowerCase()} ${SHAPES[o.shape].name.toLowerCase()} for ${fmt(orderPay(o))}`, W / 2, 154);
+  ctx.font = '15px Georgia';
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  ctx.fillText(`Commission: a ${SIZES[o.size].name.toLowerCase()} ${COLORS[o.color].name.toLowerCase()} ${SHAPES[o.shape].name.toLowerCase()} for ${fmt(orderPay(o))}`, W / 2, 154);
+  ctx.font = 'italic 13px Georgia';
+  ctx.fillStyle = 'rgba(255,223,158,0.6)';
+  ctx.fillText('workshop standing: ' + skillTitle() + '  ·  streak ×' + save.streak, W / 2, 176);
 
-  drawPiece(W / 2, 280, o.color, o.shape, SIZES[o.size].target, false);
+  const bob = Math.sin(game.time * 1.8) * 4;
+  drawPiece(W / 2, 270 + bob, o.color, o.shape, SIZES[o.size].target, false);
 
-  ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
-  ctx.font = 'bold 18px Georgia';
-  ctx.fillText('click Take the order or press Space', W / 2, 428);
-  button(W / 2 - 110, 446, 220, 40, '🔥 Take the order', true, () => startOrder());
+  button(W / 2 - 110, 430, 220, 42, '🔥 Light the furnace', true, () => startOrder());
+  ctx.font = 'italic 13px Georgia';
+  ctx.fillStyle = 'rgba(255,246,220,0.55)';
+  ctx.fillText('or press Space', W / 2, 494);
 
-  ctx.font = 'bold 15px Georgia';
-  ctx.fillStyle = '#ffdf9e';
-  ctx.fillText('TOOLSHOP', 70, 500);
-  ctx.font = '13px Georgia';
-  ctx.fillStyle = 'rgba(255,255,255,0.55)';
-  ctx.fillText('colors are unlocked with the same buttons', 70, 519 + 0);
-
-  const uy = 534;
+  const uy = 520;
   let ux = 40;
   for (const up of UPGRADES) {
     const lvl = save.up[up.key];
     const maxed = lvl >= up.costs.length;
     const cost = maxed ? 0 : up.costs[lvl];
     const afford = save.money >= cost && !maxed;
-    button(ux, uy, 205, 66,
+    button(ux, uy, 205, 40,
       maxed ? `${up.name} — FULL` : `${up.name}  ${fmt(cost)}`,
       afford,
-      () => { save.money -= cost; save.up[up.key]++; persist(); beep(600, 0.1, 'triangle', 0.1); });
+      () => { save.money -= cost; save.up[up.key]++; persist(); beep(600, 0.1, 'triangle', 0.1); }, true);
     ctx.font = '12px Georgia';
     ctx.fillStyle = maxed ? 'rgba(160,220,160,0.7)' : 'rgba(255,255,255,0.55)';
-    ctx.fillText(up.desc, ux + 102, uy + 82);
+    ctx.fillText(up.desc, ux + 102, uy + 56);
     ux += 225;
   }
 
   const cx = 717;
-  ctx.font = 'bold 15px Georgia';
+  ctx.font = 'bold 14px Georgia';
   ctx.fillStyle = '#ffdf9e';
-  ctx.fillText('GLASS COLORS', cx, 500);
-  let cy = 520;
+  ctx.textAlign = 'left';
+  ctx.fillText('GLASS COLORS', cx, 494);
+  let cy = 504;
   for (const key of Object.keys(COLORS)) {
     const c = COLORS[key];
     const owned = save.unlocked.includes(key);
     const afford = save.money >= c.price;
-    button(cx, cy, 205, 30,
+    button(cx, cy, 205, 26,
       owned ? `${c.name} ✓` : `${c.name}  ${fmt(c.price)}`,
-      owned || (afford && save.unlocked.length < Object.keys(COLORS).length),
-      owned ? null : () => { save.money -= c.price; save.unlocked.push(key); persist(); beep(700, 0.12, 'triangle', 0.12); });
-    cy += 38;
+      !owned && afford,
+      owned ? null : () => { save.money -= c.price; save.unlocked.push(key); persist(); beep(700, 0.12, 'triangle', 0.12); }, true);
+    cy += 32;
+  }
+}
+
+function coldWarn() {
+  if (game.temp < 25 && (game.phase === PHASE_BLOW || game.phase === PHASE_SHAPE)) {
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 18px Georgia';
+    ctx.fillStyle = `rgba(255,110,70,${0.5 + Math.sin(game.time * 10) * 0.3})`;
+    ctx.fillText('⚠ glass is freezing — work fast!', W / 2, 442);
   }
 }
 
@@ -889,10 +1164,10 @@ function drawHeat() {
   drawHUD();
 
   const tempFrac = clamp(game.temp / 110, 0, 1);
-  drawGauge(W / 2 - 220, 500, 440, 26, tempFrac,
-    [{ c: 80 / 110, half: 10 / 110 }], '#ffcf6b', 'FURNACE HEAT — release in the green zone');
-
-  drawHint('Hold to heat the gather', 'release inside the green zone · too hot and it drips off the pipe');
+  drawGauge('heat', W / 2 - 220, 510, 440, 26, tempFrac,
+    [{ c: 80 / 110, half: 10 / 110 }], '#ffcf6b',
+    'FURNACE HEAT — release inside the green', game.temp > 100);
+  drawHint('Hold to heat the gather', 'release inside the green · too hot and it drips off the pipe');
 }
 
 function drawBlow() {
@@ -906,16 +1181,11 @@ function drawBlow() {
   const target = SIZES[game.order.size].target;
   const maxR = target * 1.38;
   const zones = save.up.gauge > 0 ? [{ c: target / maxR, half: 9 / maxR }] : [];
-  const marker = save.up.gauge > 0 ? 'Bubble size' : 'Bubble size — calipers would show the target';
-  drawGauge(W / 2 - 220, 500, 440, 26, clamp(game.size / maxR, 0, 1), zones, '#8fb8ff', marker);
-
-  if (game.temp < 30) {
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 18px Georgia';
-    ctx.fillStyle = `rgba(255,120,80,${0.5 + Math.sin(game.time * 10) * 0.25})`;
-    ctx.fillText('⚠ cooling fast — finish the blow!', W / 2, 450);
-  }
-  drawHint('Hold to blow the bubble', 'watch the size — overblow it and it pops · heat fades as you work');
+  drawGauge('blow', W / 2 - 220, 510, 440, 26, clamp(game.size / maxR, 0, 1), zones, '#8fb8ff',
+    save.up.gauge > 0 ? 'BUBBLE SIZE — release inside the green' : 'BUBBLE SIZE — calipers would reveal the target',
+    game.size > target * 1.22);
+  coldWarn();
+  drawHint('Hold to blow the bubble', 'the heat fades as you work — overblow it and it pops');
 }
 
 function drawShape() {
@@ -928,15 +1198,17 @@ function drawShape() {
 
   const n = game.zones.length;
   const done = game.tapsDone;
-  drawHint(done === 0 ? 'Shape the piece — tap in the green zones' : `Shaping… ${done}/${n} ${done === 1 ? 'pull' : 'pulls'} done`,
-    done === 0 ? 'each pull is scored — the pointer speeds up' : 'keep the rhythm');
+  drawHint(done === 0 ? 'Shape the piece — tap in the green zones'
+    : (game.phase === PHASE_SHAPE ? `Shaping… ${done}/${n} pulls done` : 'Shaped!'),
+    done === 0 ? 'each pull narrows the zone and speeds the pointer' : 'keep the rhythm');
   if (game.phase === PHASE_SHAPE) {
     const z = game.zones[done];
-    const myZones = [{ c: z.c, half: z.half }];
-    drawGauge(W / 2 - 220, 500, 440, 26, game.pointer, myZones, '#ffcf6b', `Pull ${done + 1} of ${n}`);
+    if (z) drawGauge('shape' + done, W / 2 - 220, 510, 440, 26, game.pointer,
+      [{ c: z.c, half: z.half }], '#ffcf6b', `PULL ${done + 1} of ${n}`);
   } else {
-    drawGauge(W / 2 - 220, 500, 440, 26, 1, [], '#8fd48f', 'Shaped!');
+    drawGauge('shapeDone', W / 2 - 220, 510, 440, 26, 1, [], '#8fd48f', 'SHAPED');
   }
+  coldWarn();
 }
 
 function drawAnneal() {
@@ -948,10 +1220,10 @@ function drawAnneal() {
   drawHUD();
 
   const frac = clamp(game.temp / 100, 0, 1);
-  drawGauge(W / 2 - 220, 500, 440, 26, frac,
-    [{ c: 0.535, half: 0.085 }], '#9fc4ff', 'KILN COOLING — tap to anneal inside the window');
-
-  drawHint('Anneal it', 'tap when the cooling marker is in the window — too hot or too cold invites cracks');
+  drawGauge('anneal', W / 2 - 220, 510, 440, 26, frac,
+    [{ c: (ANN_WINDOW.lo + ANN_WINDOW.hi) / 2 / 100, half: (ANN_WINDOW.hi - ANN_WINDOW.lo) / 2 / 100 }],
+    '#9fc4ff', 'KILN COOLING — tap when the marker is inside', game.temp > 72);
+  drawHint('Anneal it', 'tap inside the window — touch it too hot or too cold and it may crack');
 }
 
 function drawResult() {
@@ -961,32 +1233,72 @@ function drawResult() {
   const o = game.order;
   const q = game.fail ? 0 : quality(o);
 
+  if (!game.fail && q >= 92 && Math.random() < 0.2) sparkleAt(W / 2 + rand(-90, 90), 340 + rand(-70, 70));
+  drawParticles();
+
   ctx.textAlign = 'center';
-  ctx.font = 'bold 30px Georgia';
-  ctx.fillStyle = game.fail ? '#ff8f6b' : '#ffdf9e';
-  ctx.fillText(game.fail ? 'Ruined!' : game.rating, W / 2, 150);
+  ctx.font = 'bold 32px Georgia';
+  ctx.fillStyle = game.fail ? '#ff8f6b' : q >= 92 ? '#ffd75e' : '#ffdf9e';
+  ctx.fillText(game.fail ? 'Ruined!' : game.rating, W / 2, 130);
 
   if (game.fail) {
     ctx.font = '17px Georgia';
     ctx.fillStyle = 'rgba(255,246,220,0.75)';
-    ctx.fillText(game.message, W / 2, 186);
-    ctx.fillStyle = '#1c1510';
+    ctx.fillText(game.message, W / 2, 166);
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
     ctx.beginPath();
-    ctx.ellipse(W / 2, 450, 60, 10, 0, 0, Math.PI * 2);
+    ctx.ellipse(W / 2, 452, 64, 11, 0, 0, Math.PI * 2);
     ctx.fill();
+    ctx.font = 'italic 14px Georgia';
+    ctx.fillStyle = 'rgba(255,246,220,0.5)';
+    ctx.fillText('sweep up and try again', W / 2, 486);
   } else {
-    drawPiece(W / 2, 340, o.color, o.shape, SIZES[o.size].target, q < 40);
-    ctx.font = '17px Georgia';
-    ctx.fillStyle = 'rgba(255,246,220,0.85)';
-    ctx.fillText(`quality ${q}/100`, W / 2, 450);
+    drawPiece(W / 2, 330, o.color, o.shape, SIZES[o.size].target, q < 40);
+
+    const stages = [
+      ['heat', game.scores.heat, '#ffcf6b'],
+      ['blow', game.scores.blow, '#8fb8ff'],
+      ['shape', game.scores.shape, '#bfe8ff'],
+      ['anneal', game.scores.anneal, '#9fe8a8'],
+    ];
+    const bx = W / 2 - 180, by = 418;
+    ctx.font = '12px Georgia';
+    ctx.textAlign = 'right';
+    stages.forEach((st, i) => {
+      const y = by + i * 22;
+      ctx.fillStyle = 'rgba(255,246,220,0.7)';
+      ctx.fillText(st[0], bx - 10, y + 11);
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      roundRect(bx, y, 220, 12, 4); ctx.fill();
+      ctx.fillStyle = st[2];
+      roundRect(bx, y, clamp(st[1] / 100, 0, 1) * 220, 12, 4); ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.textAlign = 'left';
+      ctx.fillText(st[1], bx + 230, y + 11);
+      ctx.textAlign = 'right';
+    });
+    ctx.textAlign = 'center';
+
+    let ly = by + 4 * 22 + 26;
+    ctx.font = '15px Georgia';
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillText(`quality ${q}/100`, W / 2, ly); ly += 26;
+    if (game.streakBonus > 0) {
+      ctx.fillStyle = '#ffb35c';
+      ctx.fillText(`streak bonus +${fmt(game.streakBonus)}`, W / 2, ly); ly += 26;
+    }
+    if (q >= 92) {
+      ctx.fillStyle = '#ffd75e';
+      ctx.fillText('masterwork bonus! ×1.25', W / 2, ly); ly += 26;
+    }
     ctx.font = 'bold 26px Georgia';
     ctx.fillStyle = '#9fe8a8';
-    ctx.fillText('+' + fmt(game.pay) + (q >= 92 ? '  (masterwork bonus!)' : ''), W / 2, 490);
+    ctx.fillText('+' + fmt(game.pay), W / 2, ly + 4);
   }
 
-  ctx.font = `bold 18px Georgia`;
+  ctx.font = 'bold 17px Georgia';
   ctx.fillStyle = `rgba(255,223,158,${0.6 + Math.sin(game.time * 4) * 0.3})`;
-  ctx.fillText('click or press Space for the next order', W / 2, 560);
+  ctx.fillText('click or press Space for the next commission', W / 2, 600);
 }
 
 /* ============================== main loop ============================== */
@@ -1005,6 +1317,11 @@ function render() {
     case '_shaping': drawShape(); break;
     case PHASE_ANNEAL: drawAnneal(); break;
     case PHASE_RESULT: drawResult(); break;
+  }
+  if (game.flash > 0) {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = `rgba(255,230,180,${game.flash * 0.35})`;
+    ctx.fillRect(0, 0, W, H);
   }
 }
 
